@@ -1,70 +1,62 @@
-# ghactioner — GitHub Actions cost strategy for Laravel projects
+# ghactioner
 
-Reference notes and drop-in workflow templates to reduce GitHub Actions spend
-across a fleet of Laravel repos.
+GitHub Actions workflow templates for Laravel projects, set up to keep CI minutes
+low. Comes out of cleaning up CI across a set of Laravel repos that were running
+up a much bigger Actions bill than the work justified.
 
-For Laravel work the cost is rarely macOS minutes. It's structural waste on
-cheap Linux runners, multiplied across many repos: workflows that never cancel
-superseded runs, re-download every dependency from scratch, and run Xdebug for
-coverage nobody reads.
+## What was actually costing money
 
----
+Not macOS minutes. Everything ran on cheap Linux runners. The waste was the same
+few mistakes repeated in every repo:
 
-## The five cost drivers (and the fix)
+- Workflows had no `concurrency` cancel, so pushing a few commits to a PR left
+  several full runs going at once.
+- Nothing was cached, so every run downloaded all of Composer and npm from
+  scratch.
+- Tests ran with `coverage: xdebug`, which is 2-5x slower, for a coverage report
+  nobody looked at.
+- `tests`/`lint` fired on both `push` and `pull_request`, so the same commit got
+  built twice.
+- Installs used `npm i` instead of `npm ci`.
 
-| # | Driver | Symptom | Fix |
-|---|--------|---------|-----|
-| 1 | **No `concurrency` cancel** | Push 5 commits to a PR → 5 full runs bill to completion in parallel | `concurrency` block with `cancel-in-progress: true` |
-| 2 | **No dependency caching** | Every run re-resolves Composer **and** re-downloads npm | `actions/cache` for `vendor` + `cache: npm` on `setup-node` |
-| 3 | **`coverage: xdebug`** | Tests run 2–5× slower for a coverage report nobody consumes | `coverage: none` (only enable Xdebug/PCOV when you actually publish coverage) |
-| 4 | **push + pull_request double-trigger** | The same commit runs CI twice | Trigger on `pull_request` only; reuse the green result on merge (`post-merge.yml`) |
-| 5 | **`npm i` / `npm install`** | Non-deterministic, slower installs | `npm ci` against the committed lockfile |
+Fixing all of that cut billed minutes by roughly half to two thirds without
+changing what the tests actually do.
 
-Plus a hard backstop that has nothing to do with YAML:
+Before touching any YAML, set a spending limit under Settings > Billing >
+Actions so a runaway loop can't quietly drain the account.
 
-> **Set a spending limit** in GitHub → Settings → Billing → Actions. Cap it so a
-> runaway loop can't silently empty the wallet. Do this first.
+## Versions
 
-The YAML fixes typically cut billed minutes by 50–70% with no change to test
-coverage.
+Pin Node and PHP to what you run locally and in production. CI should test what
+you ship.
 
----
-
-## Version baseline (keep current; verify before adopting)
-
-| Tool | Use | Why |
-|------|-----|-----|
-| **Node** | `24` | Active LTS (2026). 22 is maintenance LTS, EOL Apr 2027. |
-| **PHP** | `8.5` | Match local and production; `composer.json` `^8.3` allows it. |
-
-Pin both to what your `package.json` `engines` / `composer.json` `require.php`
-and your local toolchain actually use. CI should test what you ship.
-
----
+- Node 24 (active LTS). Node 22 is on maintenance and goes EOL April 2027.
+- PHP 8.5, which `composer.json: "^8.3"` already allows.
 
 ## Templates
 
-Drop-in files live in [`templates/.github/workflows/`](templates/.github/workflows/):
+The workflows live in `templates/.github/workflows/`:
 
-- **`tests.yml`** — Pest/PHPUnit + asset build, PR-only, cached, matrix-named `ci (8.5)`.
-- **`lint.yml`** — Pint, static analysis, frontend format/lint/typecheck, cached.
-- **`post-merge.yml`** — reuses the green PR checks on the merge commit so CI
-  never re-runs on `develop`/`main` (kills the push/PR double-bill).
+- `tests.yml` runs Pest/PHPUnit and the asset build. PR-only and cached. Its
+  check is named `ci (8.5)` via the matrix.
+- `lint.yml` runs Pint and the frontend format/lint checks. PR-only and cached.
+- `post-merge.yml` copies the green PR check results onto the merge commit, so
+  CI doesn't run again on a push to `develop` or `main`.
 
-Copy them into a repo's `.github/workflows/`, then adjust the per-repo knobs
-called out in [`templates/README.md`](templates/README.md).
+Copy them into a repo's `.github/workflows/` and adjust the per-repo settings
+described in `templates/README.md`.
 
----
-
-## Rollout checklist (per repo)
+## Applying to a repo
 
 1. Copy the three templates into `.github/workflows/`.
-2. Set `php-version` in the `tests.yml` matrix to the repo's target (e.g. `8.5`).
-3. Make `post-merge.yml`'s `requiredChecks` match the actual check names —
-   `'ci (<php-version>)'` and `'quality'`.
-4. Confirm `composer.lock` and `package-lock.json` are committed (caching + `npm ci` need them).
-5. If the repo has docs/security CI steps (e.g. `docs:lint`), do **not** add a
+2. Set `php-version` in the `tests.yml` matrix to that repo's version.
+3. Update `requiredChecks` in `post-merge.yml` to match the check names, which
+   are `ci (<php-version>)` and `quality`.
+4. Make sure `composer.lock` and `package-lock.json` are committed, since
+   caching and `npm ci` rely on them.
+5. If the repo has docs or security steps like `docs:lint`, don't add a
    `paths-ignore` that would skip them.
-6. Open a PR and verify: both checks green, cache **hit** on the 2nd run, runtime drops.
+6. Open a PR and check that both jobs pass, the cache hits on the second run,
+   and the runtime drops.
 
-Once one repo is proven, repeat across the fleet.
+Prove it on one repo, then do the rest.
