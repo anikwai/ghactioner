@@ -1,0 +1,116 @@
+name: post-merge
+
+# After a PR merge, attach the green PR check results to the merge commit on
+# develop/main so branch history shows CI ticks without re-running lint/tests.
+# This lets tests.yml/lint.yml trigger on pull_request only.
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Merge commit SHA to backfill check statuses onto
+        required: true
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  propagate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'Merge pull request #') || contains(github.event.head_commit.message, '(#')
+    steps:
+      - name: Propagate PR check status to merge commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Must match the check names emitted by tests.yml + lint.yml.
+            const requiredChecks = ['quality', 'ci (8.5)'];
+            const { owner, repo } = context.repo;
+            const mergeSha = context.eventName === 'workflow_dispatch'
+              ? context.payload.inputs.commit_sha
+              : context.sha;
+
+            let message = context.payload.head_commit?.message;
+
+            if (context.eventName === 'workflow_dispatch') {
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: mergeSha,
+              });
+              message = commit.commit.message;
+            }
+
+            // Merge commits: "Merge pull request #840 from …" — must win over "(#831)" in the body/title.
+            const mergeMatch = message.match(/^Merge pull request #(\d+)/m);
+            const squashMatch = message.match(/^[^\n]*\(#(\d+)\)/m);
+            const match = mergeMatch ?? squashMatch;
+
+            if (!match) {
+              core.setFailed('Commit message does not include a PR number.');
+              return;
+            }
+
+            const prNumber = Number.parseInt(match[1], 10);
+
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            if (!pullRequest.merged_at) {
+              core.setFailed(`PR #${prNumber} is not merged.`);
+              return;
+            }
+
+            const { data: prChecks } = await github.rest.checks.listForRef({
+              owner,
+              repo,
+              ref: pullRequest.head.sha,
+              filter: 'latest',
+            });
+
+            for (const checkName of requiredChecks) {
+              const checkRun = prChecks.check_runs.find((run) => run.name === checkName);
+
+              if (!checkRun) {
+                core.setFailed(`Missing PR check "${checkName}" on PR #${prNumber}.`);
+                return;
+              }
+
+              if (checkRun.conclusion !== 'success') {
+                core.setFailed(`PR check "${checkName}" did not succeed (conclusion: ${checkRun.conclusion ?? 'none'}).`);
+                return;
+              }
+
+              await github.rest.checks.create({
+                owner,
+                repo,
+                name: checkName,
+                head_sha: mergeSha,
+                status: 'completed',
+                conclusion: 'success',
+                details_url: checkRun.details_url ?? checkRun.html_url,
+                output: {
+                  title: 'Passed on pull request',
+                  summary: [
+                    `Reused the green \`${checkName}\` result from PR #${prNumber}.`,
+                    `PR head: \`${pullRequest.head.sha.slice(0, 7)}\``,
+                    checkRun.details_url
+                      ? `[View original PR run](${checkRun.details_url})`
+                      : `[View PR checks](${pullRequest.html_url}/checks)`,
+                  ].join('\n\n'),
+                },
+              });
+            }
+
+            core.summary.addHeading('Post-merge check propagation');
+            core.summary.addRaw(`Attached ${requiredChecks.length} green PR checks to merge commit \`${mergeSha.slice(0, 7)}\` from PR #${prNumber}.`);
+            await core.summary.write();
