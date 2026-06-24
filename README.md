@@ -26,6 +26,21 @@ In `templates/.github/workflows/`:
 
 Both use Node 24 and PHP 8.5. Pin these to whatever your repo actually runs.
 
+## Promoting develop to main
+
+CI runs on PRs into develop. To promote to production without re-running it:
+
+```
+git checkout main && git fetch origin develop
+git merge --ff-only origin/develop && git push origin main
+git checkout develop
+```
+
+The fast-forward makes main point at the exact commit that already passed CI, so
+the green checks carry over and no build runs on the push. This needs main to
+allow direct pushes (no "require pull request" protection); adding that rule
+forces a develop -> main PR, which costs one extra build per release.
+
 ## Applying to a repo
 
 1. Copy the templates into `.github/workflows/`.
